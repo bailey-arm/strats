@@ -1,0 +1,39 @@
+# venv
+venv/
+.venv/
+env/
+
+# data — keep the tree, not the bytes
+data/raw/**
+data/processed/**
+data/universe/**
+!data/**/.gitkeep
+
+# notebook cruft
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# models / artefacts
+models/
+checkpoints/
+mlruns/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# secrets
+.env
+.env.*
+!.env.example
