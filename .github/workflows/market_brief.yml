@@ -1,0 +1,40 @@
+name: Market brief
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"    # AM    — 08:00 BST / 07:00 GMT
+    - cron: "30 13 * * 1-5"  # Midday — 14:30 BST / 13:30 GMT
+    - cron: "30 20 * * 1-5"  # PM    — 21:30 BST / 20:30 GMT
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Slot (am | midday | pm)"
+        required: true
+        default: "midday"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install yfinance requests pandas
+
+      - name: Resolve slot
+        id: slot
+        run: |
+          case "${{ github.event.schedule }}" in
+            "0 7 * * 1-5")    echo "slot=am"     >> "$GITHUB_OUTPUT" ;;
+            "30 13 * * 1-5")  echo "slot=midday" >> "$GITHUB_OUTPUT" ;;
+            "30 20 * * 1-5")  echo "slot=pm"     >> "$GITHUB_OUTPUT" ;;
+            *)                echo "slot=${{ github.event.inputs.slot }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - run: python scripts/market_brief.py --slot "${{ steps.slot.outputs.slot }}"
+        env:
+          RESEND_API_KEY: ${{ secrets.market_brief }}
