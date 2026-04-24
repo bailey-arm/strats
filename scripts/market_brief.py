@@ -606,10 +606,10 @@ def build_email(slot: str) -> tuple[str, str]:
     sections.append(build_table("Custom Factors", [("Mag7 (eq-wt)", mag7_row)], include_wtd, "pct"))
 
     # IV term structure — AM slot only (option-chain fetch is slow).
-    if slot == "am":
-        iv_html = build_iv_section(watchlist_tickers)
-        if iv_html:
-            sections.append(iv_html)
+    #if slot == "am":
+    iv_html = build_iv_section(watchlist_tickers)
+    if iv_html:
+        sections.append(iv_html)
 
     mover = biggest_mover(price_flat)
     if mover:
