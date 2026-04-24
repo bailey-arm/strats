@@ -86,9 +86,9 @@ GRID = "#333333"
 LINE_COLORS = [AMBER, "#00D9FF", POS, "#BE85FF", "#FFE14C", "#FF9EC6", NEG]
 
 
-def fetch_closes(tickers: list[str]) -> pd.DataFrame:
+def fetch_closes(tickers: list[str], period: str = "15d") -> pd.DataFrame:
     data = yf.download(
-        tickers, period="15d", interval="1d", progress=False, auto_adjust=False,
+        tickers, period=period, interval="1d", progress=False, auto_adjust=False,
         group_by="ticker", threads=True,
     )
     if isinstance(data.columns, pd.MultiIndex):
@@ -411,6 +411,17 @@ def _iv_at_delta(side: pd.DataFrame, is_call: bool, spot: float, T: float, targe
     return float(np.interp(target, ds, vs))
 
 
+def compute_rv20(closes: pd.Series) -> float:
+    """Annualised 20-day close-to-close realised vol (decimal)."""
+    s = closes.dropna()
+    if len(s) < 21:
+        return float("nan")
+    log_ret = np.log(s / s.shift(1)).dropna()
+    if len(log_ret) < 20:
+        return float("nan")
+    return float(log_ret.tail(20).std() * math.sqrt(252))
+
+
 def compute_skew_1m(data: dict) -> dict:
     """Returns {rr, bf} (25-delta risk reversal, butterfly) at ~1M using the
     nearest available expiry in [15, 60] days. Values in vol points (not pct)."""
@@ -448,10 +459,10 @@ def interp_iv(curve: pd.DataFrame, target_days: int) -> float:
 
 
 def _build_iv_table(surface: pd.DataFrame) -> str:
-    """surface columns: sector, ticker, 1W, 1M, 3M, 6M, rr, bf.
-    All IV values stored as decimals; displayed as vol points (×100)."""
+    """surface columns: sector, ticker, 1W, 1M, 3M, 6M, rr, bf, rv20, ivrv, move1d.
+    All IV/RV values stored as decimals; displayed as vol points (×100)."""
     tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
-    cols = ["TICKER"] + tenor_cols + ["6M-1W", "1M RR", "1M BF"]
+    cols = ["TICKER"] + tenor_cols + ["6M-1W", "1M RR", "1M BF", "20d RV", "IV-RV", "1d Mv"]
     th_style = (
         f"text-align:right;padding:4px 10px;color:{AMBER};"
         f"border-bottom:1px solid {AMBER};font-weight:normal;letter-spacing:0.5px"
@@ -490,6 +501,16 @@ def _build_iv_table(surface: pd.DataFrame) -> str:
                 tds.append(f'<td style="{td_num};color:{NEG if rr_pts < 0 else POS}">{rr_pts:+.1f}</td>')
             bf = r.get("bf")
             tds.append(f'<td style="{td_num}">{bf * 100:+.1f}</td>' if pd.notna(bf) else td_na)
+            rv = r.get("rv20")
+            tds.append(f'<td style="{td_num}">{rv * 100:.1f}</td>' if pd.notna(rv) else td_na)
+            ivrv = r.get("ivrv")
+            if pd.isna(ivrv):
+                tds.append(td_na)
+            else:
+                ivrv_pts = ivrv * 100
+                tds.append(f'<td style="{td_num};color:{NEG if ivrv_pts < 0 else POS}">{ivrv_pts:+.1f}</td>')
+            mv = r.get("move1d")
+            tds.append(f'<td style="{td_num}">{mv * 100:.2f}%</td>' if pd.notna(mv) else td_na)
             body_rows.append(f"<tr>{''.join(tds)}</tr>")
     return (
         f'<table cellspacing="0" cellpadding="0" style="font-family:{FONT};'
@@ -517,6 +538,8 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
     if not data_by_ticker:
         return ""
 
+    rv_closes = fetch_closes(list(data_by_ticker.keys()), period="60d")
+
     tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
     rows: list[dict] = []
     for sector, tickers in sectors.items():
@@ -525,12 +548,20 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
                 continue
             d = data_by_ticker[t]
             skew = compute_skew_1m(d)
+            atm_1m = interp_iv(d["atm"], 30)
+            rv20 = compute_rv20(rv_closes[t]) if t in rv_closes.columns else float("nan")
+            ivrv = atm_1m - rv20 if not (math.isnan(atm_1m) or math.isnan(rv20)) else float("nan")
+            move1d = atm_1m * math.sqrt(1 / 252) if not math.isnan(atm_1m) else float("nan")
             rows.append({
                 "sector": sector, "ticker": t,
                 **{IV_TENOR_LABELS[tn]: interp_iv(d["atm"], tn) for tn in IV_TENORS_DAYS},
                 "rr": skew["rr"], "bf": skew["bf"],
+                "rv20": rv20, "ivrv": ivrv, "move1d": move1d,
             })
-    surface = pd.DataFrame(rows, columns=["sector", "ticker"] + tenor_cols + ["rr", "bf"])
+    surface = pd.DataFrame(
+        rows,
+        columns=["sector", "ticker"] + tenor_cols + ["rr", "bf", "rv20", "ivrv", "move1d"],
+    )
     if surface.empty:
         return ""
 
