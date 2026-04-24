@@ -8,12 +8,15 @@ import io
 import os
 import sys
 import urllib.request
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import requests
+import yaml
 import yfinance as yf
 
 
@@ -35,6 +38,22 @@ YIELDS: list[tuple[str, str, str]] = [
 
 MAG7 = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
 SLOT_LABELS = {"am": "AM", "midday": "Midday", "pm": "PM"}
+
+WATCHLIST_PATH = Path(__file__).parent / "watchlist.yaml"
+
+# Yahoo option chains are US-listed only; non-US names are silently skipped.
+IV_SECTORS: dict[str, list[str]] = {
+    "Mega-Tech":   ["AAPL", "MSFT", "NVDA", "META", "GOOGL"],
+    "Semis":       ["AVGO", "AMD", "TSM", "MU"],
+    "Financials":  ["JPM", "GS", "BAC"],
+    "Consumer":    ["AMZN", "WMT", "HD"],
+    "Healthcare":  ["LLY", "UNH"],
+    "Energy":      ["XOM", "CVX"],
+    "ETFs":        ["SPY", "QQQ", "IWM"],
+}
+IV_TENORS_DAYS = [7, 30, 90, 180]
+IV_TENOR_LABELS = {7: "1W", 30: "1M", 90: "3M", 180: "6M"}
+IV_MIN_DAYS_TO_EXPIRY = 2
 
 FONT = "Consolas, Menlo, 'Courier New', monospace"
 AMBER = "#FA8C00"
@@ -268,12 +287,241 @@ def biggest_mover(all_rows: list[tuple[str, dict]]) -> tuple[str, float] | None:
     return max(valid, key=lambda x: abs(x[1]))
 
 
+def load_watchlist() -> list[str]:
+    if not WATCHLIST_PATH.exists():
+        return []
+    with WATCHLIST_PATH.open() as f:
+        data = yaml.safe_load(f) or {}
+    return [str(t).strip() for t in (data.get("tickers") or []) if str(t).strip()]
+
+
+def _atm_iv(tk: yf.Ticker, expiry: str, spot: float) -> float:
+    try:
+        chain = tk.option_chain(expiry)
+    except Exception:
+        return float("nan")
+    calls, puts = chain.calls, chain.puts
+    if calls.empty or puts.empty:
+        return float("nan")
+    k_call = calls.iloc[(calls["strike"] - spot).abs().argsort()[:1]]
+    k_put = puts.iloc[(puts["strike"] - spot).abs().argsort()[:1]]
+    ivs = [
+        float(k_call["impliedVolatility"].iloc[0]),
+        float(k_put["impliedVolatility"].iloc[0]),
+    ]
+    ivs = [x for x in ivs if 0.02 < x < 3.0]
+    return float(np.mean(ivs)) if ivs else float("nan")
+
+
+def fetch_iv_curve(ticker: str) -> pd.DataFrame:
+    tk = yf.Ticker(ticker)
+    try:
+        fi = tk.fast_info
+        spot = float(fi.get("last_price") or fi.get("lastPrice"))
+    except Exception:
+        try:
+            spot = float(tk.history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            return pd.DataFrame(columns=["days", "iv"])
+    today = dt.date.today()
+    rows: list[tuple[int, float]] = []
+    for exp in tk.options:
+        try:
+            days = (dt.datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+        except ValueError:
+            continue
+        if days < IV_MIN_DAYS_TO_EXPIRY:
+            continue
+        iv = _atm_iv(tk, exp, spot)
+        if not np.isnan(iv):
+            rows.append((days, iv))
+    return pd.DataFrame(rows, columns=["days", "iv"]).sort_values("days").reset_index(drop=True)
+
+
+def interp_iv(curve: pd.DataFrame, target_days: int) -> float:
+    if curve.empty:
+        return float("nan")
+    d = curve["days"].to_numpy()
+    iv = curve["iv"].to_numpy()
+    if target_days <= d[0]:
+        return float(iv[0])
+    if target_days >= d[-1]:
+        return float(iv[-1])
+    tv = (iv ** 2) * d
+    tv_t = np.interp(target_days, d, tv)
+    return float(np.sqrt(tv_t / target_days))
+
+
+def _build_iv_table(surface: pd.DataFrame) -> str:
+    """surface columns: sector, ticker, 1W, 1M, 3M, 6M."""
+    tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
+    cols = ["TICKER"] + tenor_cols + ["6M-1W"]
+    th_style = (
+        f"text-align:right;padding:4px 10px;color:{AMBER};"
+        f"border-bottom:1px solid {AMBER};font-weight:normal;letter-spacing:0.5px"
+    )
+    th_left = th_style.replace("text-align:right", "text-align:left")
+    head = "".join(
+        f'<th style="{th_left if i == 0 else th_style}">{c}</th>'
+        for i, c in enumerate(cols)
+    )
+    body_rows: list[str] = []
+    ncols = len(cols)
+    for sector, grp in surface.groupby("sector", sort=False):
+        body_rows.append(
+            f'<tr><td colspan="{ncols}" style="padding:6px 10px 2px;'
+            f'color:{AMBER};font-size:11px;letter-spacing:1px;'
+            f'border-bottom:1px solid {GRID}">{sector.upper()}</td></tr>'
+        )
+        for _, r in grp.iterrows():
+            td_num = f"padding:2px 10px;text-align:right;border-bottom:1px solid {GRID};color:{FG}"
+            td_txt = f"padding:2px 10px;text-align:left;border-bottom:1px solid {GRID};color:{FG}"
+            tds = [f'<td style="{td_txt}">{r["ticker"]}</td>']
+            for c in tenor_cols:
+                v = r[c]
+                tds.append(
+                    f'<td style="{td_num}">{v * 100:.1f}</td>'
+                    if pd.notna(v)
+                    else f'<td style="{td_num};color:{DIM}">n/a</td>'
+                )
+            slope = (r["6M"] - r["1W"]) * 100 if pd.notna(r["6M"]) and pd.notna(r["1W"]) else None
+            if slope is None:
+                tds.append(f'<td style="{td_num};color:{DIM}">n/a</td>')
+            else:
+                color = NEG if slope < 0 else POS
+                tds.append(f'<td style="{td_num};color:{color}">{slope:+.1f}</td>')
+            body_rows.append(f"<tr>{''.join(tds)}</tr>")
+    return (
+        f'<table cellspacing="0" cellpadding="0" style="font-family:{FONT};'
+        f'font-size:13px;border-collapse:collapse;color:{FG};width:100%;margin-top:6px">'
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    )
+
+
+def _png_to_inline_img(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG, bbox_inches="tight", dpi=80)
+    plt.close(fig)
+    try:
+        from PIL import Image
+        im = Image.open(buf).convert("RGB").quantize(colors=32, method=Image.Quantize.MEDIANCUT)
+        out = io.BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        png_bytes = out.getvalue()
+    except Exception:
+        png_bytes = buf.getvalue()
+    b64 = base64.b64encode(png_bytes).decode()
+    return (
+        f'<img src="data:image/png;base64,{b64}" alt="" '
+        f'style="width:100%;max-width:640px;display:block;margin:6px 0 0">'
+    )
+
+
+def _build_iv_summary_plot(surface: pd.DataFrame) -> str:
+    tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
+    sector_avg = surface.groupby("sector", sort=False)[tenor_cols].mean()
+    if sector_avg.empty:
+        return ""
+    fig, ax = plt.subplots(figsize=(6.4, 2.6), facecolor=BG)
+    ax.set_facecolor(BG)
+    for i, (sector, row) in enumerate(sector_avg.iterrows()):
+        color = LINE_COLORS[i % len(LINE_COLORS)]
+        ax.plot(IV_TENORS_DAYS, row.values * 100, "-o", color=color,
+                markersize=4, linewidth=1.2, label=sector)
+    ax.set_xscale("log")
+    ax.set_xticks(IV_TENORS_DAYS)
+    ax.set_xticklabels(tenor_cols, color=FG)
+    ax.set_ylabel("ATM IV (%)", color=FG, fontsize=8)
+    ax.tick_params(colors=FG, labelsize=8)
+    ax.grid(color=GRID, alpha=0.5, linewidth=0.3)
+    for s in ax.spines.values():
+        s.set_color(AMBER); s.set_linewidth(0.5)
+    ax.legend(loc="best", facecolor=BG, edgecolor=AMBER, labelcolor=FG, fontsize=7, ncol=2)
+    fig.tight_layout(pad=0.3)
+    return _png_to_inline_img(fig)
+
+
+def _build_iv_grid_plot(curves: dict[str, pd.DataFrame], sectors: dict[str, list[str]]) -> str:
+    active = [(s, [t for t in ts if t in curves]) for s, ts in sectors.items()]
+    active = [(s, ts) for s, ts in active if ts]
+    if not active:
+        return ""
+    ncols = 2
+    nrows = (len(active) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.2, 1.8 * nrows), facecolor=BG, squeeze=False)
+    for idx, (sector, tickers) in enumerate(active):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.set_facecolor(BG)
+        for j, t in enumerate(tickers):
+            c = curves[t]
+            if c.empty:
+                continue
+            color = LINE_COLORS[j % len(LINE_COLORS)]
+            ax.plot(c["days"], c["iv"] * 100, "-", color=color, linewidth=1.0, label=t)
+            ax.text(c["days"].iloc[-1] * 1.05, float(c["iv"].iloc[-1] * 100), t,
+                    color=color, fontsize=6, va="center", family="monospace")
+        ax.set_xscale("log")
+        ax.set_title(sector, color=AMBER, loc="left", fontsize=9)
+        ax.tick_params(colors=FG, labelsize=7)
+        ax.grid(color=GRID, alpha=0.5, linewidth=0.3)
+        for s in ax.spines.values():
+            s.set_color(AMBER); s.set_linewidth(0.4)
+    for k in range(len(active), nrows * ncols):
+        axes[k // ncols][k % ncols].axis("off")
+    fig.tight_layout(pad=0.4)
+    return _png_to_inline_img(fig)
+
+
+def build_iv_section(watchlist_tickers: list[str]) -> str:
+    sectors: dict[str, list[str]] = {k: list(v) for k, v in IV_SECTORS.items()}
+    us_watchlist = [t for t in watchlist_tickers if "." not in t and "-" not in t]
+    if us_watchlist:
+        sectors["Watchlist"] = us_watchlist
+
+    all_tickers = sorted({t for ts in sectors.values() for t in ts})
+    curves: dict[str, pd.DataFrame] = {}
+    for t in all_tickers:
+        try:
+            curve = fetch_iv_curve(t)
+            if not curve.empty:
+                curves[t] = curve
+        except Exception as e:
+            print(f"IV fetch failed for {t}: {e}", file=sys.stderr)
+
+    if not curves:
+        return ""
+
+    tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
+    rows: list[dict] = []
+    for sector, tickers in sectors.items():
+        for t in tickers:
+            if t not in curves:
+                continue
+            rows.append({
+                "sector": sector, "ticker": t,
+                **{IV_TENOR_LABELS[d]: interp_iv(curves[t], d) for d in IV_TENORS_DAYS},
+            })
+    surface = pd.DataFrame(rows, columns=["sector", "ticker"] + tenor_cols)
+    if surface.empty:
+        return ""
+
+    header = (
+        f'<div style="color:{AMBER};font-family:{FONT};font-size:13px;'
+        f'margin:20px 0 4px;letter-spacing:1px">&#9632; IV TERM STRUCTURE</div>'
+    )
+    return header + _build_iv_summary_plot(surface) + _build_iv_grid_plot(curves, sectors) + _build_iv_table(surface)
+
+
 def build_email(slot: str) -> tuple[str, str]:
     """Fetch data and build the email. Returns (subject, html). No network send."""
     include_wtd = slot == "pm"
     label = SLOT_LABELS[slot]
 
-    price_tickers = sorted({t for b in BUCKETS.values() for t in b} | set(MAG7))
+    watchlist_tickers = load_watchlist()
+
+    price_tickers = sorted(
+        {t for b in BUCKETS.values() for t in b} | set(MAG7) | set(watchlist_tickers)
+    )
     closes = fetch_closes(price_tickers)
     yields_df = fetch_yields()
 
@@ -336,6 +584,15 @@ def build_email(slot: str) -> tuple[str, str]:
         + build_chart({t: closes[t] for t in ss_tickers if t in closes.columns}, "pct")
     )
 
+    # Watchlist
+    if watchlist_tickers:
+        wl_rows_tbl = [(t, price_rows.get(t, {"last": None, "daily": None, "wtd": None})) for t in watchlist_tickers]
+        price_flat.extend(wl_rows_tbl)
+        sections.append(
+            build_table("Watchlist", wl_rows_tbl, include_wtd, "pct")
+            + build_chart({t: closes[t] for t in watchlist_tickers if t in closes.columns}, "pct")
+        )
+
     # Custom factors: Mag7 equal-weight
     mag7_daily = [price_rows[t]["daily"] for t in MAG7 if price_rows[t]["daily"] is not None]
     mag7_row = {
@@ -347,6 +604,12 @@ def build_email(slot: str) -> tuple[str, str]:
         mag7_wtd = [price_rows[t]["wtd"] for t in MAG7 if price_rows[t]["wtd"] is not None]
         mag7_row["wtd"] = sum(mag7_wtd) / len(mag7_wtd) if mag7_wtd else None
     sections.append(build_table("Custom Factors", [("Mag7 (eq-wt)", mag7_row)], include_wtd, "pct"))
+
+    # IV term structure — AM slot only (option-chain fetch is slow).
+    if slot == "am":
+        iv_html = build_iv_section(watchlist_tickers)
+        if iv_html:
+            sections.append(iv_html)
 
     mover = biggest_mover(price_flat)
     if mover:

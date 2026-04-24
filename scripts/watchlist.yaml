@@ -1,0 +1,7 @@
+# Market-brief watchlist. Edit + commit; GitHub Actions picks up on next cron.
+# US-listed names get IV term structure; non-US names are price-only.
+tickers:
+  - PLTR
+  - AVGO
+  - SMCI
+  - ARM
