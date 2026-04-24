@@ -53,6 +53,23 @@ def _clean_ticker(t: str) -> str:
     return str(t).strip().replace(".", "-")
 
 
+_WIKI_COL_MAP: dict[str, str] = {
+    # wiki-column-substring (lowercased)  →  output column name
+    "security": "name",
+    "gics sector": "gics_sector",
+    "gics sub-industry": "gics_sub_industry",
+    "headquarters": "headquarters",
+    "date added": "date_added",
+    "cik": "cik",
+    "founded": "founded",
+}
+
+
+def _pick_col(df: pd.DataFrame, needle: str) -> str | None:
+    """Return the first column whose lowercased name contains ``needle``."""
+    return next((c for c in df.columns if needle in str(c).lower()), None)
+
+
 def build_universe() -> pd.DataFrame:
     tables = _fetch_wiki_tables()
     current = tables[0].copy()
@@ -60,10 +77,25 @@ def build_universe() -> pd.DataFrame:
 
     # --- current constituents -------------------------------------------------
     # Columns have varied historically; locate by case-insensitive match.
-    sym_col = next(c for c in current.columns if "symbol" in str(c).lower())
+    sym_col = _pick_col(current, "symbol")
     current = current.rename(columns={sym_col: "ticker"})
     current["ticker"] = current["ticker"].map(_clean_ticker)
     current_tickers = set(current["ticker"])
+
+    # Pull the GICS / HQ / date-added / CIK / founded metadata for current names.
+    meta_cols = {}
+    for needle, out_name in _WIKI_COL_MAP.items():
+        col = _pick_col(current, needle)
+        if col is not None:
+            meta_cols[out_name] = current[col]
+    current_meta = pd.DataFrame({"ticker": current["ticker"], **meta_cols})
+    if "date_added" in current_meta.columns:
+        current_meta["date_added"] = pd.to_datetime(
+            current_meta["date_added"], errors="coerce"
+        )
+    if "cik" in current_meta.columns:
+        current_meta["cik"] = pd.to_numeric(current_meta["cik"], errors="coerce").astype("Int64")
+    current_meta = current_meta.drop_duplicates(subset="ticker", keep="first")
 
     # --- historical changes ---------------------------------------------------
     # Columns look like: ("Effective Date", "Effective Date"), ("Added", "Ticker"),
@@ -112,6 +144,10 @@ def build_universe() -> pd.DataFrame:
     # If still in the index, last_removed is NaT — flag accordingly.
     universe["ever_removed"] = universe["last_removed_date"].notna()
 
+    # GICS / HQ / CIK / etc. only available for current constituents — historical
+    # names get NaN. For long-horizon PIT sector tagging you need a paid vendor.
+    universe = universe.merge(current_meta, on="ticker", how="left")
+
     return universe.sort_values("ticker").reset_index(drop=True)
 
 
@@ -126,6 +162,9 @@ def main() -> None:
         f"  currently in index: {uni['currently_in_index'].sum()} | "
         f"ever removed: {uni['ever_removed'].sum()}"
     )
+    if "gics_sector" in uni.columns:
+        have = uni["gics_sector"].notna().sum()
+        print(f"  GICS sector tagged: {have} / {len(uni)} (current constituents only)")
 
 
 if __name__ == "__main__":

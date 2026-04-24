@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install yfinance requests pandas
+      - run: pip install yfinance requests pandas matplotlib
 
       - name: Resolve slot
         id: slot
