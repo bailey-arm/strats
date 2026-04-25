@@ -434,6 +434,40 @@ def compute_return_moments(closes: pd.Series, window: int = 60) -> dict:
     return {"skew": float(log_ret.skew()), "kurt": float(log_ret.kurt())}
 
 
+def compute_pct_ranks(closes: pd.Series, iv_1m: float) -> dict:
+    """
+    Percentile ranks (0–100) using trailing 1-year realized distributions as proxies:
+    iv_pct:  current 1M IV vs rolling-20d-RV history.
+    rr_pct:  current 60d realized skew vs rolling-60d-skew history.
+    bf_pct:  current 60d realized excess kurtosis vs rolling-60d-kurt history.
+    """
+    s = closes.dropna()
+    result = {"iv_pct": float("nan"), "rr_pct": float("nan"), "bf_pct": float("nan")}
+    if len(s) < 22:
+        return result
+    log_ret = np.log(s / s.shift(1)).dropna()
+
+    if not math.isnan(iv_1m) and len(log_ret) >= 20:
+        rv_hist = log_ret.rolling(20).std().dropna().values * math.sqrt(252)
+        if len(rv_hist) >= 10:
+            result["iv_pct"] = float(100 * np.mean(rv_hist <= iv_1m))
+
+    if len(log_ret) >= 60:
+        skew_hist = log_ret.rolling(60).skew().dropna()
+        if len(skew_hist) >= 10:
+            current_skew = float(log_ret.tail(60).skew())
+            if not math.isnan(current_skew):
+                result["rr_pct"] = float(100 * np.mean(skew_hist.values <= current_skew))
+
+        kurt_hist = log_ret.rolling(60).kurt().dropna()
+        if len(kurt_hist) >= 10:
+            current_kurt = float(log_ret.tail(60).kurt())
+            if not math.isnan(current_kurt):
+                result["bf_pct"] = float(100 * np.mean(kurt_hist.values <= current_kurt))
+
+    return result
+
+
 def compute_skew_1m(data: dict) -> dict:
     """Returns {rr, bf} (25-delta risk reversal, butterfly) at ~1M using the
     nearest available expiry in [15, 60] days. Values in vol points (not pct)."""
@@ -470,11 +504,25 @@ def interp_iv(curve: pd.DataFrame, target_days: int) -> float:
     return float(np.sqrt(tv_t / target_days))
 
 
+def _fmt_pct_rank(v, td_num: str, td_na: str, high_is_bad: bool = False) -> str:
+    """Render a 0–100 percentile rank. Extremes (<20 / >80) are coloured."""
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return td_na
+    vi = round(v)
+    if vi > 80:
+        color = NEG if high_is_bad else AMBER
+    elif vi < 20:
+        color = POS if high_is_bad else AMBER
+    else:
+        color = FG
+    return f'<td style="{td_num};color:{color}">{vi}%</td>'
+
+
 def _build_iv_table(surface: pd.DataFrame) -> str:
-    """surface columns: sector, ticker, 1W, 1M, 3M, 6M, rr, bf, rv20, ivrv, move1d, rskew, rkurt.
+    """surface columns: sector, ticker, 1W, 1M, 3M, 6M, rr, bf, rv20, ivrv, move1d, rskew, rkurt, iv_pct, rr_pct, bf_pct.
     IV/RV values stored as decimals; displayed as vol points (×100)."""
     tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
-    cols = ["TICKER"] + tenor_cols + ["6M-1W", "1M RR", "1M BF", "20d RV", "IV-RV", "1d Mv", "Skew60", "Kurt60"]
+    cols = ["TICKER"] + tenor_cols + ["6M-1W", "IV%", "1M RR", "RR%", "1M BF", "BF%", "20d RV", "IV-RV", "1d Mv", "Skew60", "Kurt60"]
     th_style = (
         f"text-align:right;padding:4px 10px;color:{AMBER};"
         f"border-bottom:1px solid {AMBER};font-weight:normal;letter-spacing:0.5px"
@@ -505,14 +553,20 @@ def _build_iv_table(surface: pd.DataFrame) -> str:
                 tds.append(td_na)
             else:
                 tds.append(f'<td style="{td_num};color:{NEG if slope < 0 else POS}">{slope:+.1f}</td>')
+            # IV% — high pct = expensive vol (red)
+            tds.append(_fmt_pct_rank(r.get("iv_pct", float("nan")), td_num, td_na, high_is_bad=True))
             rr = r.get("rr")
             if pd.isna(rr):
                 tds.append(td_na)
             else:
                 rr_pts = rr * 100
                 tds.append(f'<td style="{td_num};color:{NEG if rr_pts < 0 else POS}">{rr_pts:+.1f}</td>')
+            # RR% — extremes amber (unusual skew regime)
+            tds.append(_fmt_pct_rank(r.get("rr_pct", float("nan")), td_num, td_na, high_is_bad=False))
             bf = r.get("bf")
             tds.append(f'<td style="{td_num}">{bf * 100:+.1f}</td>' if pd.notna(bf) else td_na)
+            # BF% — extremes amber (unusual kurtosis regime)
+            tds.append(_fmt_pct_rank(r.get("bf_pct", float("nan")), td_num, td_na, high_is_bad=False))
             rv = r.get("rv20")
             tds.append(f'<td style="{td_num}">{rv * 100:.1f}</td>' if pd.notna(rv) else td_na)
             ivrv = r.get("ivrv")
@@ -557,7 +611,7 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
     if not data_by_ticker:
         return ""
 
-    rv_closes = fetch_closes(list(data_by_ticker.keys()), period="120d")
+    rv_closes = fetch_closes(list(data_by_ticker.keys()), period="1y")
 
     tenor_cols = [IV_TENOR_LABELS[d] for d in IV_TENORS_DAYS]
     rows: list[dict] = []
@@ -571,6 +625,7 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
             series = rv_closes[t] if t in rv_closes.columns else pd.Series(dtype=float)
             rv20 = compute_rv20(series)
             moments = compute_return_moments(series, window=60)
+            pcts = compute_pct_ranks(series, atm_1m)
             ivrv = atm_1m - rv20 if not (math.isnan(atm_1m) or math.isnan(rv20)) else float("nan")
             move1d = atm_1m * math.sqrt(1 / 252) if not math.isnan(atm_1m) else float("nan")
             rows.append({
@@ -579,10 +634,11 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
                 "rr": skew["rr"], "bf": skew["bf"],
                 "rv20": rv20, "ivrv": ivrv, "move1d": move1d,
                 "rskew": moments["skew"], "rkurt": moments["kurt"],
+                "iv_pct": pcts["iv_pct"], "rr_pct": pcts["rr_pct"], "bf_pct": pcts["bf_pct"],
             })
     surface = pd.DataFrame(
         rows,
-        columns=["sector", "ticker"] + tenor_cols + ["rr", "bf", "rv20", "ivrv", "move1d", "rskew", "rkurt"],
+        columns=["sector", "ticker"] + tenor_cols + ["rr", "bf", "rv20", "ivrv", "move1d", "rskew", "rkurt", "iv_pct", "rr_pct", "bf_pct"],
     )
     if surface.empty:
         return ""
