@@ -38,5 +38,6 @@ tqdm>=4.66
 
 # --- Dev / quality-of-life ---
 pyyaml>=6.0
+openpyxl>=3.1          # Excel attachment generation
 python-dotenv>=1.0
 joblib>=1.4

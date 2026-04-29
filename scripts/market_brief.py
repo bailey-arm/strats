@@ -15,6 +15,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 import pandas as pd
 import requests
 import yaml
@@ -592,7 +594,7 @@ def _build_iv_table(surface: pd.DataFrame) -> str:
     )
 
 
-def build_iv_section(watchlist_tickers: list[str]) -> str:
+def build_iv_section(watchlist_tickers: list[str]) -> tuple[str, pd.DataFrame]:
     sectors: dict[str, list[str]] = {k: list(v) for k, v in IV_SECTORS.items()}
     us_watchlist = [t for t in watchlist_tickers if "." not in t and "-" not in t]
     if us_watchlist:
@@ -609,7 +611,7 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
             print(f"IV fetch failed for {t}: {e}", file=sys.stderr)
 
     if not data_by_ticker:
-        return ""
+        return "", pd.DataFrame()
 
     rv_closes = fetch_closes(list(data_by_ticker.keys()), period="1y")
 
@@ -641,17 +643,17 @@ def build_iv_section(watchlist_tickers: list[str]) -> str:
         columns=["sector", "ticker"] + tenor_cols + ["rr", "bf", "rv20", "ivrv", "move1d", "rskew", "rkurt", "iv_pct", "rr_pct", "bf_pct"],
     )
     if surface.empty:
-        return ""
+        return "", pd.DataFrame()
 
     header = (
         f'<div style="color:{AMBER};font-family:{FONT};font-size:13px;'
         f'margin:20px 0 4px;letter-spacing:1px">&#9632; VOL SURFACE</div>'
     )
-    return header + _build_iv_table(surface)
+    return header + _build_iv_table(surface), surface
 
 
-def build_email(slot: str) -> tuple[str, str]:
-    """Fetch data and build the email. Returns (subject, html). No network send."""
+def build_email(slot: str) -> tuple[str, str, dict]:
+    """Fetch data and build the email. Returns (subject, html, excel_data). No network send."""
     include_wtd = slot == "pm"
     label = SLOT_LABELS[slot]
 
@@ -757,9 +759,8 @@ def build_email(slot: str) -> tuple[str, str]:
         mag7_row["wtd"] = sum(mag7_wtd) / len(mag7_wtd) if mag7_wtd else None
     sections.append(build_table("Custom Factors", [("Mag7 (eq-wt)", mag7_row)], include_wtd, "pct"))
 
-    # IV term structure — AM slot only (option-chain fetch is slow).
-    #if slot == "am":
-    iv_html = build_iv_section(watchlist_tickers)
+    # IV term structure — shown on all slots.
+    iv_html, surface_df = build_iv_section(watchlist_tickers)
     if iv_html:
         sections.append(iv_html)
 
@@ -804,7 +805,102 @@ def build_email(slot: str) -> tuple[str, str]:
         f"</div>"
         f"</td></tr></table>"
     )
-    return subject, html
+    excel_data = {
+        "price_rows": price_rows,
+        "yield_rows": yield_rows,
+        "buckets": BUCKETS,
+        "sx5e_tickers": SX5E_TICKERS,
+        "watchlist_tickers": watchlist_tickers,
+        "mag7_row": mag7_row,
+        "surface_df": surface_df,
+        "include_wtd": include_wtd,
+    }
+    return subject, html, excel_data
+
+
+def _xl_header(ws, values: list[str]) -> None:
+    """Write a bold amber header row to a worksheet."""
+    fill = PatternFill("solid", fgColor="FA8C00")
+    for col, v in enumerate(values, 1):
+        cell = ws.cell(row=1, column=col, value=v)
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+
+
+def build_excel_bytes(
+    price_rows: dict[str, dict],
+    yield_rows: dict[str, dict],
+    buckets: dict[str, list[str]],
+    sx5e_tickers: list[str],
+    watchlist_tickers: list[str],
+    mag7_row: dict,
+    surface_df: pd.DataFrame,
+    include_wtd: bool,
+) -> bytes:
+    wb = openpyxl.Workbook()
+
+    # ── Prices sheet ───────────────────────────────────────────────────────────
+    ws_p = wb.active
+    ws_p.title = "Prices"
+    price_headers = ["Ticker", "Section", "Last", "Daily %"] + (["WTD %"] if include_wtd else [])
+    _xl_header(ws_p, price_headers)
+
+    def _price_rows_iter():
+        for section, tickers in buckets.items():
+            for t in tickers:
+                r = price_rows.get(t, {})
+                yield t, section, r.get("last"), r.get("daily"), r.get("wtd")
+        for t in sx5e_tickers:
+            r = price_rows.get(t, {})
+            yield t, "SX5E", r.get("last"), r.get("daily"), r.get("wtd")
+        for t in watchlist_tickers:
+            r = price_rows.get(t, {})
+            yield t, "Watchlist", r.get("last"), r.get("daily"), r.get("wtd")
+        yield "Mag7 (eq-wt)", "Custom", None, mag7_row.get("daily"), mag7_row.get("wtd")
+
+    for row_i, (ticker, section, last, daily, wtd) in enumerate(_price_rows_iter(), 2):
+        ws_p.cell(row=row_i, column=1, value=ticker)
+        ws_p.cell(row=row_i, column=2, value=section)
+        ws_p.cell(row=row_i, column=3, value=round(last, 4) if last is not None else None)
+        ws_p.cell(row=row_i, column=4, value=round(daily, 4) if daily is not None else None)
+        if include_wtd:
+            ws_p.cell(row=row_i, column=5, value=round(wtd, 4) if wtd is not None else None)
+    for col in ws_p.columns:
+        ws_p.column_dimensions[col[0].column_letter].width = 16
+
+    # ── Yields sheet ──────────────────────────────────────────────────────────
+    ws_y = wb.create_sheet("Yields")
+    yield_headers = ["Tenor", "Last (%)", "Daily (bps)"] + (["WTD (bps)"] if include_wtd else [])
+    _xl_header(ws_y, yield_headers)
+    for row_i, (label, r) in enumerate(yield_rows.items(), 2):
+        ws_y.cell(row=row_i, column=1, value=label)
+        ws_y.cell(row=row_i, column=2, value=round(r["last"], 3) if r["last"] is not None else None)
+        ws_y.cell(row=row_i, column=3, value=round(r["daily"], 2) if r["daily"] is not None else None)
+        if include_wtd:
+            ws_y.cell(row=row_i, column=4, value=round(r["wtd"], 2) if r["wtd"] is not None else None)
+    for col in ws_y.columns:
+        ws_y.column_dimensions[col[0].column_letter].width = 16
+
+    # ── Vol Surface sheet ──────────────────────────────────────────────────────
+    if not surface_df.empty:
+        ws_v = wb.create_sheet("Vol Surface")
+        vol_cols = list(surface_df.columns)
+        _xl_header(ws_v, vol_cols)
+        for row_i, (_, row) in enumerate(surface_df.iterrows(), 2):
+            for col_i, col in enumerate(vol_cols, 1):
+                v = row[col]
+                if isinstance(v, float) and math.isnan(v):
+                    v = None
+                elif isinstance(v, float):
+                    v = round(v, 6)
+                ws_v.cell(row=row_i, column=col_i, value=v)
+        for col in ws_v.columns:
+            ws_v.column_dimensions[col[0].column_letter].width = 13
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def main() -> int:
@@ -812,7 +908,12 @@ def main() -> int:
     ap.add_argument("--slot", choices=["am", "midday", "pm"], required=True)
     args = ap.parse_args()
 
-    subject, html = build_email(args.slot)
+    subject, html, excel_data = build_email(args.slot)
+
+    xlsx_bytes = build_excel_bytes(**excel_data)
+    xlsx_b64 = base64.b64encode(xlsx_bytes).decode()
+    today = dt.date.today().isoformat()
+    xlsx_filename = f"market_brief_{today}_{args.slot}.xlsx"
 
     api_key = os.environ["RESEND_API_KEY"]
     r = requests.post(
@@ -823,6 +924,7 @@ def main() -> int:
             "to": ["bailey.arm.business@gmail.com"],
             "subject": subject,
             "html": html,
+            "attachments": [{"filename": xlsx_filename, "content": xlsx_b64}],
         },
         timeout=30,
     )
