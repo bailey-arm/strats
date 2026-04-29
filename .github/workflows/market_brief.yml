@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install yfinance requests pandas matplotlib numpy pyyaml pillow
+      - run: pip install yfinance requests pandas matplotlib numpy pyyaml pillow openpyxl
 
       - name: Resolve slot
         id: slot
