@@ -487,7 +487,7 @@ def compute_skew_1m(data: dict) -> dict:
     atm_1m = interp_iv(data["atm"], 30)
     if math.isnan(c_iv) or math.isnan(p_iv):
         return {"rr": float("nan"), "bf": float("nan")}
-    rr = c_iv - p_iv
+    rr = p_iv - c_iv
     bf = 0.5 * (c_iv + p_iv) - atm_1m if not math.isnan(atm_1m) else float("nan")
     return {"rr": rr, "bf": bf}
 
