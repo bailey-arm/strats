@@ -67,8 +67,14 @@ C = {
 def _fred(sid: str) -> pd.Series:
     url = (f'https://fred.stlouisfed.org/graph/fredgraph.csv'
            f'?id={sid}&vintage_date={TODAY.strftime("%Y-%m-%d")}')
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=45)
+            r.raise_for_status()
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
     df = pd.read_csv(io.StringIO(r.text), index_col='observation_date')
     df.index = pd.to_datetime(df.index)
     return pd.to_numeric(df.iloc[:, 0], errors='coerce').loc[FETCH_START:]
@@ -135,13 +141,16 @@ def page_cover(pdf, data):
     fig, ax = plt.subplots(figsize=(11, 8.5))
     ax.axis('off')
 
-    dff_now   = data['dff'].dropna().iloc[-1]
-    lo_now    = data['lo'].dropna().iloc[-1]
-    hi_now    = data['hi'].dropna().iloc[-1]
-    y1_now    = data['1Y'].dropna().iloc[-1]
-    implied_cuts = (y1_now - dff_now) / 0.25
-    be10_now  = data.get('be10', pd.Series()).dropna()
-    be10_val  = be10_now.iloc[-1] if not be10_now.empty else float('nan')
+    def _last(key):
+        s = data.get(key, pd.Series())
+        return s.dropna().iloc[-1] if not s.dropna().empty else float('nan')
+
+    dff_now  = _last('dff')
+    lo_now   = _last('lo')
+    hi_now   = _last('hi')
+    y1_now   = _last('1Y')
+    implied_cuts = (y1_now - dff_now) / 0.25 if not np.isnan(y1_now) else float('nan')
+    be10_val = _last('be10')
 
     ax.text(0.5, 0.87, 'SOFR & Fed Rate Path Dynamics',
             ha='center', fontsize=28, fontweight='bold',
@@ -149,12 +158,15 @@ def page_cover(pdf, data):
     ax.text(0.5, 0.79, 'Implied path from Treasury bill yields  ·  Event-study around FOMC',
             ha='center', fontsize=14, color='#8b949e', transform=ax.transAxes)
 
+    def _fmt(v, fmt='.2f', suffix='%'):
+        return f'{v:{fmt}}{suffix}' if not np.isnan(v) else 'n/a'
+
     stats = [
-        ('Effective Fed Funds',   f'{dff_now:.2f}%'),
-        ('Target range',          f'{lo_now:.2f}% – {hi_now:.2f}%'),
-        ('1Y T-bill (implied avg)',f'{y1_now:.2f}%'),
-        ('Implied cuts (1Y)',      f'{implied_cuts:+.1f}  ×25bp'),
-        ('10Y breakeven',          f'{be10_val:.2f}%' if not np.isnan(be10_val) else 'n/a'),
+        ('Effective Fed Funds',    _fmt(dff_now)),
+        ('Target range',           f'{_fmt(lo_now)} – {_fmt(hi_now)}'),
+        ('1Y T-bill (implied avg)', _fmt(y1_now)),
+        ('Implied cuts (1Y)',       _fmt(implied_cuts, '+.1f', ' ×25bp') if not np.isnan(implied_cuts) else 'n/a'),
+        ('10Y breakeven',           _fmt(be10_val)),
     ]
     xs = [0.12, 0.38, 0.62, 0.88]
     for i, (label, val) in enumerate(stats):

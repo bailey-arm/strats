@@ -1,0 +1,173 @@
+OPTIONS TRADING UTILS — BUILD TODO
+====================================
+For: hedge fund trading seat
+Scope: multi-product option portfolios, full Greeks, implied correlation
+
+BUILD ORDER
+-----------
+Phase 1 — Foundation
+  [ ] BSM pricer (calls/puts, continuous dividends)
+  [ ] Black-76 pricer (futures/forward options)
+  [ ] Bachelier (normal model) pricer
+  [ ] Implied vol inversion — Jaeckel "Let's be rational" + Brent fallback
+  [ ] Normal (Bachelier) implied vol inversion
+  [ ] Analytic BSM Greeks — delta, vega, theta, rho, epsilon
+  [ ] Analytic BSM 2nd order — gamma, vanna, volga/vomma, charm, veta
+  [ ] Analytic BSM 3rd order — speed, zomma, color, ultima
+  [ ] Dollar Greeks and percent Greeks normalization
+  [ ] Forward price calculation (spot, rates, continuous + term-structure dividends)
+  [ ] Discount factor / zero curve (flat and bootstrapped)
+  [ ] Put-call parity checker + synthetic forward extraction
+  [ ] Intrinsic/time value decomposition pre-inversion
+
+Phase 2 — Portfolio Layer
+  [ ] Position container — multi-leg, multi-product, multi-expiry
+  [ ] Greek roll-up — aggregate per product, per expiry, across book
+  [ ] Vega bucketing — by expiry pillar (1w, 1m, 3m, 6m, 1y, 2y) and delta bucket
+  [ ] Weighted vega — normalized by sqrt(T) for term-structure-neutral view
+  [ ] Cross-gamma matrix — pairwise gamma between products
+  [ ] Skew exposure — 25d risk reversal vega differential
+  [ ] Convexity exposure — butterfly vega / volga across strikes
+
+Phase 3 — Vol Surface
+  [ ] Market quote ingestion — filter bad quotes, compute mid IV, normalize moneyness
+  [ ] SVI parametrization — 5-param per slice (Gatheral)
+  [ ] SSVI — globally consistent surface, arbitrage-free
+  [ ] Cubic spline / SABR interpolation in strike space per expiry
+  [ ] Term structure interpolation — flat forward vol, variance-weighted between pillars
+  [ ] Arbitrage detection — calendar spread arb, butterfly arb
+  [ ] Surface smoothing — regularized least-squares fit
+
+Phase 4 — Implied Correlation
+  [ ] Single-correlation model — back out flat rho from index IV and member IVs
+  [ ] Implied correlation surface — by strike and expiry
+  [ ] Dispersion P&L decomposition — realized vs implied correlation, realized vs implied vol per member
+  [ ] Correlation term structure — forward implied correlation between expiries
+  [ ] Basket implied vol — moment matching + Monte Carlo from member vols + correlation matrix
+  [ ] Worst-of / best-of correlation sensitivity
+  [ ] Realized correlation estimator — Pearson + Hayashi-Yoshida (async data)
+  [ ] Dividend stripping — implied dividends from put-call parity
+
+Phase 5 — SABR Calibration
+  [ ] SABR Hagan approximation pricer
+  [ ] SABR exact Monte Carlo pricer
+  [ ] SABR calibration — per expiry, Levenberg-Marquardt on alpha, beta, rho, nu
+  [ ] SVI / SSVI calibration — constrained optimization, arbitrage-free conditions
+  [ ] Calibration diagnostics — RMSE, vega-weighted RMSE, residual smile plots
+
+Phase 6 — P&L Explain & Scenario Tools
+  [ ] P&L explain — delta, gamma, theta, vega, vanna, volga attribution
+  [ ] Scenario P&L — bump-and-reval over spot × vol grid
+  [ ] Vega ladder — parallel / tilting / twisting vol move sensitivity
+  [ ] Theta P&L — time decay per day, per position
+  [ ] Vol carry — position vega × (implied vol − realized vol)
+  [ ] Straddle / strangle / risk reversal / butterfly / condor constructors
+  [ ] Delta hedging simulation — discrete rebalancing, gamma scalping P&L vs cost
+  [ ] Stress scenarios — predefined (2008, 2020 COVID, flash crash) and custom
+  [ ] Margin / VaR estimation — historical simulation on Greeks
+
+Phase 7 — Term Structure & Model-Free Measures
+  [ ] Variance swap forward vol — extract from variance additivity
+  [ ] Forward variance curve — discrete and continuous
+  [ ] VIX-style index construction — model-free integrated variance from strip
+  [ ] Carry decomposition — theta vs realized vol carry for straddles / var swaps
+
+Phase 8 — Heston & Local Vol (heavier lift)
+  [ ] Heston pricer — characteristic function via FFT / Gauss-Laguerre
+  [ ] Heston Greeks — numerical bump
+  [ ] Heston calibration — joint across strikes and expiries
+  [ ] Local vol surface — Dupire formula applied to fitted implied vol surface
+  [ ] Local vol Monte Carlo pricer
+  [ ] Generic Monte Carlo engine — antithetic + quasi-random, path-dependent payoffs
+
+====================================
+FULL UTILS REFERENCE
+====================================
+
+1. PRICING ENGINES
+  - Black-Scholes-Merton (vanilla calls/puts, continuous + discrete dividends)
+  - Black-76 (futures/forward options: rates, commodities, index)
+  - Bachelier / normal model (near-zero rates, spread options)
+  - Heston (stochastic vol, closed-form via characteristic function, FFT/Gauss-Laguerre)
+  - SABR (Hagan approximation + exact Monte Carlo; forward vol smile)
+  - Local vol (Dupire surface from implied vol grid)
+  - Monte Carlo engine (generic, path-dependent, antithetic + quasi-random)
+
+2. IMPLIED VOLATILITY
+  - Root-finding inversion — Jaeckel "Let's be rational", Brent fallback
+  - Intrinsic/time value decomposition before inversion
+  - Normal (Bachelier) implied vol from price
+  - Forward moneyness normalization — log-forward, delta-space, % OTM
+  - Vol from bid/ask mid with spread sanity checks
+
+3. GREEKS — SINGLE LEG
+  1st order: Delta, Vega, Theta, Rho, Epsilon (div sensitivity)
+  2nd order: Gamma, Vanna, Volga/Vomma, Charm (delta decay), Veta (vega decay)
+  3rd order: Speed, Zomma, Color, Ultima
+  - Analytic BSM + numerical bump for model Greeks (Heston/SABR)
+  - Dollar Greeks (DV01-equivalent per notional)
+  - Percent Greeks (normalized by spot/forward, for cross-product aggregation)
+
+4. PORTFOLIO GREEKS AGGREGATION
+  - Multi-leg, multi-product, multi-expiry position container
+  - Greek roll-up per product, per expiry, across book
+  - Vega bucketing by expiry pillar and strike/delta bucket
+  - Cross-gamma matrix (pairwise gamma between products)
+  - Weighted vega normalized by sqrt(T)
+  - Skew exposure (25d risk reversal vega differential)
+  - Convexity exposure (butterfly vega, volga across strikes)
+
+5. VOL SURFACE
+  - Construction from market quotes (calls/puts/straddles) to implied vol grid
+  - SVI parametrization (Gatheral, 5-param per slice, arbitrage checks)
+  - SSVI — globally consistent, no butterfly/calendar arb
+  - Cubic spline / SABR interpolation per expiry
+  - Term structure interpolation (flat forward vol, variance-weighted)
+  - Arbitrage detection (calendar spread arb, butterfly arb)
+  - Surface smoothing (regularized least-squares)
+
+6. IMPLIED CORRELATION
+  - Index IV decomposition — back out implied pairwise correlation from index + member IVs
+  - Single-correlation model: sigma_idx^2 = sum_ij(wi*wj*rho*si*sj)
+  - Implied correlation surface (by strike and expiry)
+  - Dispersion P&L decomposition (realized vs implied correlation, realized vs implied vol per member)
+  - Correlation term structure (forward implied correlation between expiries)
+  - Basket implied vol (moment matching + Monte Carlo, from member vols + correlation matrix)
+  - Worst-of / best-of correlation sensitivity
+  - RV correlation (Pearson, Hayashi-Yoshida for async data)
+
+7. TERM STRUCTURE & FORWARD VOL
+  - Variance swap forward vol (variance additivity)
+  - Forward variance curve (discrete and continuous)
+  - VIX-style index construction (model-free integrated variance from strip)
+  - Carry decomposition (theta vs realized vol carry for straddles/var swaps)
+
+8. STRATEGY DECOMPOSITION & P&L
+  - Straddle / strangle / risk reversal / butterfly / condor constructors
+  - P&L explain (delta, gamma, theta, vega, vanna, volga attribution)
+  - Scenario P&L (bump-and-reval over spot × vol grid)
+  - Theta P&L per day per position
+  - Vol carry (position vega × (implied vol − realized vol))
+  - Delta hedging simulation (discrete rebalancing, gamma scalping P&L vs transaction cost)
+
+9. CALIBRATION
+  - SABR calibration per expiry (Levenberg-Marquardt on alpha, beta, rho, nu)
+  - Heston calibration (joint across strikes and expiries, FFT + optimizer)
+  - SVI / SSVI calibration (constrained optimization, arbitrage-free)
+  - Local vol surface (Dupire on fitted implied vol surface)
+  - Model diagnostics (RMSE, vega-weighted RMSE, residual smile plots)
+
+10. RISK & SCENARIO TOOLS
+  - Greeks P&L simulation (Taylor expansion to 2nd order across shock grids)
+  - Stress scenarios (2008, 2020 COVID, flash crash, custom)
+  - Vega ladder (parallel / tilting / twisting vol moves)
+  - Delta hedging simulation
+  - Margin / VaR estimation (historical simulation on Greeks)
+
+11. MARKET DATA UTILITIES
+  - Option chain normalization (filter bad quotes, compute mid IV)
+  - Forward price calculation (spot, rates, discrete + continuous dividends)
+  - Discount factor / zero curve (flat or bootstrapped)
+  - Put-call parity checker (detect violations, extract synthetic forward)
+  - Dividend stripping (implied dividends from put-call parity across strikes)
+  - Open interest / volume weighting for weighted IV aggregation

@@ -18,6 +18,10 @@ CYAN = "\033[96m"; WHITE = "\033[97m"; BLUE = "\033[94m"
 RFR = 0.045  # approx risk-free rate
 MAX_IV = 150000
 
+def _int(v, default=0):
+    """NaN-safe int: NaN is truthy so `v or 0` doesn't protect against it."""
+    return default if (v is None or v != v) else int(v)
+
 def norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
@@ -66,6 +70,126 @@ def draw_smile(strikes, call_ivs, put_ivs, spot, width=40):
         print(f"  {DIM}{'':>7}{YELLOW}{atm_line}{R}  ATM = {spot:.2f}")
 
 
+def draw_rr_plot(deltas, rr_vals, h=11, width=70):
+    """ASCII dot plot of call IV − put IV vs call delta (risk reversal skew)."""
+    pairs = [(d, r) for d, r in zip(deltas, rr_vals)
+             if d == d and r == r and 0.02 < d < 0.98]
+    if len(pairs) < 3:
+        return
+    dv, rv = zip(*pairs)
+    lo = min(rv); hi = max(rv)
+    pad = max(abs(lo), abs(hi)) * 0.12
+    lo -= pad; hi += pad
+    rng = hi - lo or 1.0
+
+    def val_to_row(v):
+        return max(0, min(h - 1, round((1 - (v - lo) / rng) * (h - 1))))
+
+    def delta_to_col(d):
+        return max(0, min(width - 1, round(d * (width - 1))))
+
+    zero_row = val_to_row(0)
+    atm_col  = delta_to_col(0.5)
+
+    # build sparse grid — on collision keep whichever is further from zero
+    grid = [[None] * width for _ in range(h)]
+    for d, v in pairs:
+        col = delta_to_col(d)
+        row = val_to_row(v)
+        prev = grid[row][col]
+        if prev is None or abs(v) > abs(prev):
+            grid[row][col] = v
+
+    print(f"\n  {CYAN}Risk Reversal  {DIM}(call IV − put IV) vs call Δ{R}\n")
+    for row in range(h):
+        label_v = hi - rng * row / (h - 1)
+        label   = f"{label_v:+.1f}%"
+        is_zero = (row == zero_row)
+        line    = ""
+        for col in range(width):
+            v = grid[row][col]
+            if v is not None:
+                color = GREEN if v > 0 else (RED if v < 0 else YELLOW)
+                line += color + BOLD + "●" + R
+            elif is_zero:
+                line += DIM + ("┼" if col == atm_col else "─") + R
+            elif col == atm_col:
+                line += DIM + "│" + R
+            else:
+                line += " "
+        axis = f"{YELLOW}──{R}" if is_zero else "  "
+        print(f"  {DIM}{label:>7}{R} {axis}│{line}")
+
+    print(f"  {DIM}{'':>9}└{'─' * width}{R}")
+
+    # tick marks at standard delta levels
+    ticks = [0.10, 0.25, 0.50, 0.75, 0.90]
+    tick_row  = [" "] * width
+    label_row = list(" " * width)
+    for t in ticks:
+        col = delta_to_col(t)
+        tick_row[col] = "↑"
+        s = f"Δ{t:.2f}"
+        start = max(0, col - len(s) // 2)
+        for i, ch in enumerate(s):
+            if start + i < width:
+                label_row[start + i] = ch
+    print(f"  {DIM}{'':>10}{''.join(tick_row)}{R}")
+    print(f"  {DIM}{'':>10}{''.join(label_row)}{R}")
+
+
+def draw_oi_tables(calls_d, puts_d, all_k, spot, top_n=8):
+    """Two ranked OI tables — calls and puts — printed side by side."""
+    def build_rows(side_d, top3):
+        ranked = sorted(
+            [(k, _int(side_d[k].get("openInterest"))) for k in all_k if k in side_d],
+            key=lambda x: -x[1]
+        )[:top_n]
+        rows = []
+        for rank, (k, oi) in enumerate(ranked, 1):
+            d    = side_d[k]
+            vol  = _int(d.get("volume"))
+            mid  = ((d.get("bid") or 0) + (d.get("ask") or 0)) / 2
+            dlt  = d.get("delta", float("nan"))
+            pct  = (k - spot) / spot * 100
+            sign = "+" if pct >= 0 else ""
+            star = "★" if k in top3 else " "
+            rows.append((rank, k, oi, vol, mid, dlt, pct, sign, star))
+        return rows
+
+    call_rows = build_rows(calls_d, {k for k, _ in sorted(
+        [(k, _int(calls_d[k].get("openInterest"))) for k in all_k if k in calls_d],
+        key=lambda x: -x[1])[:3]})
+    put_rows  = build_rows(puts_d,  {k for k, _ in sorted(
+        [(k, _int(puts_d[k].get("openInterest")))  for k in all_k if k in puts_d],
+        key=lambda x: -x[1])[:3]})
+
+    def fmt_row(rank, k, oi, vol, mid, dlt, pct, sign, star, color):
+        dlt_s = f"{dlt:.2f}" if dlt == dlt else "  ─ "
+        return (f"  {color}{rank:>2}{R}  {color}{BOLD}{k:>8.2f}{R}  "
+                f"{DIM}{sign}{pct:.1f}%{R}  "
+                f"{color}{oi:>8,}{YELLOW}{star}{R}  "
+                f"{DIM}{vol:>7,}{R}  "
+                f"{DIM}{mid:>6.2f}{R}  "
+                f"{DIM}{dlt_s:>5}{R}")
+
+    col_hdr = (f"  {DIM}{'#':>2}  {'Strike':>8}  {'vs spot':>6}  "
+               f"{'OI':>9}  {'Vol':>7}  {'Mid':>6}  {'Δ':>5}{R}")
+    col_sep = f"  {DIM}{'─' * 52}{R}"
+
+    print(f"\n  {GREEN}{BOLD}Call OI Leaders{R}")
+    print(col_hdr)
+    print(col_sep)
+    for r in call_rows:
+        print(fmt_row(*r, GREEN))
+
+    print(f"\n  {RED}{BOLD}Put OI Leaders{R}")
+    print(col_hdr)
+    print(col_sep)
+    for r in put_rows:
+        print(fmt_row(*r, RED))
+
+
 def show_chain(sym, expiry):
     os.system("clear")
     print(f"\n  {DIM}Loading {sym} {expiry} chain...{R}", end="", flush=True)
@@ -102,11 +226,11 @@ def show_chain(sym, expiry):
 
     # top-3 OI strikes per side
     call_oi_ranked = sorted(
-        [(k, int(calls_d[k].get("openInterest") or 0)) for k in all_k if k in calls_d],
+        [(k, _int(calls_d[k].get("openInterest"))) for k in all_k if k in calls_d],
         key=lambda x: -x[1]
     )
     put_oi_ranked = sorted(
-        [(k, int(puts_d[k].get("openInterest") or 0)) for k in all_k if k in puts_d],
+        [(k, _int(puts_d[k].get("openInterest")))  for k in all_k if k in puts_d],
         key=lambda x: -x[1]
     )
     top3_call_oi = {k for k, _ in call_oi_ranked[:3]}
@@ -116,9 +240,9 @@ def show_chain(sym, expiry):
     def calc_max_pain(calls_d, puts_d, strikes):
         best_k, best_pain = None, float("inf")
         for p in strikes:
-            call_pain = sum(max(0, p - k) * int(calls_d[k].get("openInterest") or 0)
+            call_pain = sum(max(0, p - k) * _int(calls_d[k].get("openInterest"))
                             for k in strikes if k in calls_d)
-            put_pain  = sum(max(0, k - p) * int(puts_d[k].get("openInterest") or 0)
+            put_pain  = sum(max(0, k - p) * _int(puts_d[k].get("openInterest"))
                             for k in strikes if k in puts_d)
             total = call_pain + put_pain
             if total < best_pain:
@@ -128,8 +252,8 @@ def show_chain(sym, expiry):
     max_pain_strike = calc_max_pain(calls_d, puts_d, all_k)
 
     # put/call OI ratio
-    total_call_oi = sum(int(calls_d[k].get("openInterest") or 0) for k in all_k if k in calls_d)
-    total_put_oi  = sum(int(puts_d[k].get("openInterest") or 0)  for k in all_k if k in puts_d)
+    total_call_oi = sum(_int(calls_d[k].get("openInterest")) for k in all_k if k in calls_d)
+    total_put_oi  = sum(_int(puts_d[k].get("openInterest"))  for k in all_k if k in puts_d)
     pc_ratio = total_put_oi / total_call_oi if total_call_oi else float("nan")
 
     os.system("clear")
@@ -169,14 +293,14 @@ def show_chain(sym, expiry):
         c_d   = fmt_f(c.get("delta", float("nan")), ".2f")
         c_iv  = fmt_f(c_iv_raw, ".1f") + ("%" if c else "")
         c_mid = fmt_f(((c.get("bid") or 0) + (c.get("ask") or 0)) / 2, ".2f") if c else "─"
-        c_vol = f"{int(c.get('volume') or 0):,}" if c else "─"
-        c_oi  = fmt_oi(int(c.get("openInterest") or 0) if c else 0, k, top3_call_oi)
+        c_vol = f"{_int(c.get('volume')):,}" if c else "─"
+        c_oi  = fmt_oi(_int(c.get("openInterest")) if c else 0, k, top3_call_oi)
 
         p_d   = fmt_f(p.get("delta", float("nan")), ".2f")
         p_iv  = fmt_f(p_iv_raw, ".1f") + ("%" if p else "")
         p_mid = fmt_f(((p.get("bid") or 0) + (p.get("ask") or 0)) / 2, ".2f") if p else "─"
-        p_vol = f"{int(p.get('volume') or 0):,}" if p else "─"
-        p_oi  = fmt_oi(int(p.get("openInterest") or 0) if p else 0, k, top3_put_oi)
+        p_vol = f"{_int(p.get('volume')):,}" if p else "─"
+        p_oi  = fmt_oi(_int(p.get("openInterest")) if p else 0, k, top3_put_oi)
 
         atm_tag = f" {YELLOW}◄{R}" if atm else ""
         mp_tag  = f" {CYAN}↔{R}" if k == max_pain_strike else ""
@@ -197,7 +321,11 @@ def show_chain(sym, expiry):
     print(sep2)
     print(f"  {DIM}{YELLOW}★{R}{DIM} = top-3 OI   {CYAN}↔{R}{DIM} = max pain   {YELLOW}◄{R}{DIM} = ATM{R}")
 
+    draw_oi_tables(calls_d, puts_d, all_k, spot)
     draw_smile(smile_k, smile_c_iv, smile_p_iv, spot)
+    rr_vals     = [c - p for c, p in zip(smile_c_iv, smile_p_iv)]
+    smile_deltas = [calls_d[k].get("delta", float("nan")) for k in smile_k]
+    draw_rr_plot(smile_deltas, rr_vals)
 
     # summary stats
     atm_call = min(calls_d, key=lambda k: abs(k - spot), default=None)

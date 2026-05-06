@@ -381,6 +381,261 @@ def fetch_iv_data(ticker: str) -> dict:
     return {"spot": spot, "atm": atm, "chains": chains}
 
 
+# ── Vol Screener ───────────────────────────────────────────────────────────────
+
+_VIX_CURVE = [("9D", "^VIX9D"), ("1M", "^VIX"), ("3M", "^VIX3M"), ("6M", "^VIX6M")]
+_SPOT_VOL_ASSETS = [("SPY", "SPY"), ("QQQ", "QQQ"), ("TLT", "TLT"), ("EUR/USD", "EURUSD=X")]
+
+
+def _fetch_vix_curve() -> tuple[dict, dict, float | None, float | None]:
+    tickers = [t for _, t in _VIX_CURVE] + ["^MOVE"]
+    try:
+        closes = fetch_closes(tickers, period="5d")
+    except Exception:
+        return {}, {}, None, None
+    cur: dict[str, float] = {}
+    pri: dict[str, float] = {}
+    for label, ticker in _VIX_CURVE:
+        if ticker in closes.columns:
+            s = closes[ticker].dropna()
+            if len(s) >= 1:
+                cur[label] = float(s.iloc[-1])
+            if len(s) >= 2:
+                pri[label] = float(s.iloc[-2])
+    move_cur = move_pri = None
+    if "^MOVE" in closes.columns:
+        s = closes["^MOVE"].dropna()
+        if len(s) >= 1:
+            move_cur = float(s.iloc[-1])
+        if len(s) >= 2:
+            move_pri = float(s.iloc[-2])
+    return cur, pri, move_cur, move_pri
+
+
+def _fetch_spy_flow() -> dict:
+    result: dict = {"pc_ratio": None, "max_pain": None, "spot": None,
+                    "exp_move_pct": None, "expiry": None}
+    try:
+        tk = yf.Ticker("SPY")
+        spot = float(tk.fast_info.last_price)
+        result["spot"] = spot
+        expiries = tk.options
+        if not expiries:
+            return result
+        today = dt.date.today()
+        valid = [e for e in expiries
+                 if (dt.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 5]
+        expiry = valid[0] if valid else expiries[0]
+        result["expiry"] = expiry
+        days_to_exp = (dt.datetime.strptime(expiry, "%Y-%m-%d").date() - today).days
+        chain = tk.option_chain(expiry)
+        calls, puts = chain.calls, chain.puts
+        total_call_oi = int(calls["openInterest"].fillna(0).sum())
+        total_put_oi = int(puts["openInterest"].fillna(0).sum())
+        if total_call_oi:
+            result["pc_ratio"] = total_put_oi / total_call_oi
+        all_k = sorted(set(calls["strike"].tolist() + puts["strike"].tolist()))
+        cd = calls.set_index("strike")["openInterest"].fillna(0).to_dict()
+        pd_ = puts.set_index("strike")["openInterest"].fillna(0).to_dict()
+        best_k, best_pain = None, float("inf")
+        for p in all_k:
+            pain = (sum(max(0.0, p - k) * cd.get(k, 0) for k in all_k) +
+                    sum(max(0.0, k - p) * pd_.get(k, 0) for k in all_k))
+            if pain < best_pain:
+                best_pain, best_k = pain, p
+        result["max_pain"] = best_k
+        atm_row = calls.iloc[(calls["strike"] - spot).abs().argsort()[:1]]
+        if not atm_row.empty:
+            iv = float(atm_row["impliedVolatility"].iloc[0])
+            if 0.02 < iv < 3.0:
+                result["exp_move_pct"] = iv * math.sqrt(days_to_exp / 252) * 100
+    except Exception as e:
+        print(f"SPY flow fetch failed: {e}", file=sys.stderr)
+    return result
+
+
+def _fetch_spot_vol_corr(window: int = 20) -> list[tuple[str, float]]:
+    tickers = [t for _, t in _SPOT_VOL_ASSETS] + ["^VIX"]
+    try:
+        prices = fetch_closes(tickers, period="3mo")
+    except Exception:
+        return []
+    if "^VIX" not in prices.columns:
+        return []
+    dvix = prices["^VIX"].diff()
+    out: list[tuple[str, float]] = []
+    for label, ticker in _SPOT_VOL_ASSETS:
+        if ticker not in prices.columns:
+            continue
+        df = pd.concat([prices[ticker].pct_change().rename("r"), dvix.rename("v")], axis=1).dropna()
+        if len(df) < window + 2:
+            continue
+        corr = float(df["r"].rolling(window).corr(df["v"]).iloc[-1])
+        if not math.isnan(corr):
+            out.append((label, corr))
+    return out
+
+
+def _vix_regime(vix_1m: float | None, is_backwardation: bool) -> tuple[str, str]:
+    if vix_1m is None:
+        return DIM, "Unknown"
+    if is_backwardation:
+        return NEG, "Backwardation — Stress"
+    if vix_1m < 12:
+        return "#00D9FF", "Suppressed"
+    if vix_1m < 16:
+        return POS, "Low"
+    if vix_1m < 22:
+        return POS, "Normal"
+    if vix_1m < 30:
+        return AMBER, "Elevated"
+    if vix_1m < 40:
+        return NEG, "High Fear"
+    return NEG, "Extreme Fear"
+
+
+def build_vol_screener_section() -> str:
+    try:
+        vix_cur, vix_pri, move_cur, move_pri = _fetch_vix_curve()
+    except Exception:
+        vix_cur, vix_pri, move_cur, move_pri = {}, {}, None, None
+    try:
+        spy_flow = _fetch_spy_flow()
+    except Exception:
+        spy_flow = {}
+    try:
+        sv_corrs = _fetch_spot_vol_corr()
+    except Exception:
+        sv_corrs = []
+
+    _td = f"padding:3px 10px;border-bottom:1px solid {GRID};font-family:{FONT};font-size:13px"
+    td_l = f"{_td};text-align:left;color:{FG}"
+    td_r = f"{_td};text-align:right;color:{FG}"
+    td_d = f"{_td};text-align:right;color:{DIM}"
+    th_b = (f"text-align:right;padding:4px 10px;color:{AMBER};"
+            f"border-bottom:1px solid {AMBER};font-weight:normal;"
+            f"letter-spacing:0.5px;font-family:{FONT};font-size:13px")
+    th_l = th_b.replace("text-align:right", "text-align:left")
+
+    def _tbl(head: str, body: str) -> str:
+        return (f'<table cellspacing="0" cellpadding="0" style="font-family:{FONT};'
+                f'font-size:13px;border-collapse:collapse;color:{FG};width:100%;margin-top:4px">'
+                f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+
+    def _sub(label: str) -> str:
+        return (f'<div style="color:{AMBER};font-family:{FONT};font-size:12px;'
+                f'margin:10px 0 2px;letter-spacing:0.5px">{label}</div>')
+
+    parts: list[str] = [
+        f'<div style="color:{AMBER};font-family:{FONT};font-size:13px;'
+        f'margin:20px 0 4px;letter-spacing:1px">&#9632; VOL SCREENER</div>'
+    ]
+
+    # ── VIX term structure ─────────────────────────────────────────────────────
+    if vix_cur:
+        vix_1m = vix_cur.get("1M")
+        vix_9d = vix_cur.get("9D")
+        vix_6m = vix_cur.get("6M")
+        is_back = vix_9d is not None and vix_1m is not None and vix_9d > vix_1m + 1.0
+        if vix_9d is not None and vix_6m is not None:
+            slope = vix_6m - vix_9d
+            sc = POS if slope > 0 else NEG
+            struct_html = f'<span style="color:{sc}">{"Contango" if slope > 0 else "Backwardation"} ({slope:+.2f})</span>'
+        else:
+            struct_html = f'<span style="color:{DIM}">n/a</span>'
+        rc, rl = _vix_regime(vix_1m, is_back)
+        rows_html = ""
+        for lbl, key in [("9D", "9D"), ("1M", "1M"), ("3M", "3M"), ("6M", "6M")]:
+            cur = vix_cur.get(key)
+            if cur is None:
+                continue
+            chg = cur - vix_pri[key] if key in vix_pri else None
+            bold = "font-weight:bold;" if lbl == "1M" else ""
+            lev = f'<td style="{td_r};{bold}">{cur:.2f}</td>'
+            if chg is None:
+                chg_td = f'<td style="{td_d}">n/a</td>'
+            else:
+                cc = NEG if chg > 0 else POS
+                chg_td = f'<td style="{td_r};color:{cc}">{chg:+.2f}</td>'
+            rows_html += f'<tr><td style="{td_l}">{lbl}</td>{lev}{chg_td}</tr>'
+        rows_html += (
+            f'<tr><td style="{td_l}">Structure</td>'
+            f'<td colspan="2" style="{td_r}">{struct_html}</td></tr>'
+            f'<tr><td style="{td_l}">Regime</td>'
+            f'<td colspan="2" style="{td_r};color:{rc};font-weight:bold">{rl}</td></tr>'
+        )
+        head = f'<th style="{th_l}">VIX</th><th style="{th_b}">LEVEL</th><th style="{th_b}">1D CHG</th>'
+        parts.append(_tbl(head, rows_html))
+
+    # ── MOVE ──────────────────────────────────────────────────────────────────
+    if move_cur is not None:
+        chg = move_cur - move_pri if move_pri is not None else None
+        chg_html = (f'<span style="color:{NEG if chg > 0 else POS}">{chg:+.2f}</span>'
+                    if chg is not None else f'<span style="color:{DIM}">n/a</span>')
+        ratio_html = ""
+        vix_1m_v = vix_cur.get("1M") if vix_cur else None
+        if vix_1m_v and vix_1m_v > 0:
+            ratio_html = (f'&nbsp;&nbsp;<span style="color:{DIM}">'
+                          f'MOVE/VIX {move_cur / vix_1m_v:.1f}x</span>')
+        parts.append(
+            f'<div style="font-family:{FONT};font-size:13px;padding:6px 0 2px;'
+            f'border-bottom:1px solid {GRID};color:{FG}">'
+            f'<span style="color:{AMBER}">MOVE</span>&nbsp;&nbsp;'
+            f'<span style="font-weight:bold">{move_cur:.1f}</span>&nbsp;&nbsp;'
+            f'{chg_html}{ratio_html}</div>'
+        )
+
+    # ── SPY options flow ───────────────────────────────────────────────────────
+    if spy_flow.get("spot"):
+        pc = spy_flow.get("pc_ratio")
+        mp = spy_flow.get("max_pain")
+        spot = spy_flow["spot"]
+        exp_pct = spy_flow.get("exp_move_pct")
+        expiry = spy_flow.get("expiry", "")
+        pc_col = NEG if (pc and pc > 1.2) else (POS if (pc and pc < 0.8) else FG)
+        pc_html = (f'<span style="color:{pc_col};font-weight:bold">{pc:.2f}</span>'
+                   if pc else f'<span style="color:{DIM}">n/a</span>')
+        if mp is not None:
+            mp_pct = (mp - spot) / spot * 100
+            sign = "+" if mp_pct >= 0 else ""
+            mp_html = (f'<span style="font-weight:bold">{mp:.1f}</span>'
+                       f'<span style="color:{DIM}"> ({sign}{mp_pct:.1f}%)</span>')
+        else:
+            mp_html = f'<span style="color:{DIM}">n/a</span>'
+        em_html = (f'<span style="font-weight:bold">&#177;{exp_pct:.1f}%</span>'
+                   if exp_pct else f'<span style="color:{DIM}">n/a</span>')
+        flow_body = (
+            f'<tr><td style="{td_l}">P/C OI ratio</td><td style="{td_r}">{pc_html}</td></tr>'
+            f'<tr><td style="{td_l}">Max pain ({expiry})</td><td style="{td_r}">{mp_html}</td></tr>'
+            f'<tr><td style="{td_l}">Expected move to expiry</td><td style="{td_r}">{em_html}</td></tr>'
+        )
+        parts.append(_sub("SPY OPTIONS FLOW"))
+        parts.append(_tbl(f'<th style="{th_l}"></th><th style="{th_b}"></th>', flow_body))
+
+    # ── Spot-vol correlation ───────────────────────────────────────────────────
+    if sv_corrs:
+        sv_body = ""
+        for label, corr in sv_corrs:
+            filled = min(30, int(abs(corr) * 30))
+            bar_col = NEG if corr < -0.3 else (POS if corr > 0.1 else AMBER)
+            bar = f'<span style="color:{bar_col};letter-spacing:-1px">{"█" * filled}{"░" * (30 - filled)}</span>'
+            corr_col = NEG if corr < -0.3 else (POS if corr > 0.1 else AMBER)
+            sv_body += (
+                f'<tr><td style="{td_l}">{label}</td>'
+                f'<td style="{td_r};color:{corr_col};font-weight:bold">{corr:+.2f}</td>'
+                f'<td style="{td_r};font-family:monospace">{bar}</td></tr>'
+            )
+        head_sv = (f'<th style="{th_l}">ASSET</th>'
+                   f'<th style="{th_b}">20D CORR vs VIX &#916;</th>'
+                   f'<th style="{th_b}"></th>')
+        parts.append(_sub("SPOT-VOL CORRELATION (20D)"))
+        parts.append(_tbl(head_sv, sv_body))
+
+    if len(parts) <= 1:
+        return ""
+    return "".join(parts)
+
+
 def _iv_at_delta(side: pd.DataFrame, is_call: bool, spot: float, T: float, target: float) -> float:
     """Interpolate IV vs Black-Scholes delta to hit `target`. r hardcoded to 5%
     (matters negligibly for delta)."""
@@ -758,6 +1013,11 @@ def build_email(slot: str) -> tuple[str, str, dict]:
         mag7_wtd = [price_rows[t]["wtd"] for t in MAG7 if price_rows[t]["wtd"] is not None]
         mag7_row["wtd"] = sum(mag7_wtd) / len(mag7_wtd) if mag7_wtd else None
     sections.append(build_table("Custom Factors", [("Mag7 (eq-wt)", mag7_row)], include_wtd, "pct"))
+
+    # Vol screener: VIX curve, MOVE, SPY options flow, spot-vol correlation.
+    vol_screener_html = build_vol_screener_section()
+    if vol_screener_html:
+        sections.append(vol_screener_html)
 
     # IV term structure — shown on all slots.
     iv_html, surface_df = build_iv_section(watchlist_tickers)
